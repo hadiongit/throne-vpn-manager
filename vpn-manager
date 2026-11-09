@@ -1,0 +1,1774 @@
+#!/usr/bin/env python3
+"""VPN Manager for Throne on Debian/Linux.
+
+Session policy:
+- A session is pinned to one static Throne profile.
+- Candidate retries are allowed only before any profile has reached RUNNING.
+- Once a profile is observed RUNNING, no other profile is ever connected by this program.
+- Auto Selector profiles are never used because they can switch exit servers during work.
+- Stop disconnects Throne, turns TUN and system proxy off, disables Kill Switch last,
+  and restores the original system timezone.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import fcntl
+import getpass
+import ipaddress
+import json
+import os
+import readline
+import re
+import shutil
+import subprocess
+import sys
+import termios
+import time
+import tty
+from pathlib import Path
+from urllib.parse import urlsplit
+from typing import Any
+
+APP = "VPN Manager"
+VERSION = "2.3.0"
+DEFAULT_THRONE_ADDR = "127.0.0.1:9095"
+DEFAULT_TUN_IFACE = "throne-tun"
+DEFAULT_LOCAL_PROXY_URL = "http://127.0.0.1:2080"
+CONNECT_TIMEOUT = 185
+IP_CHECK_ENDPOINTS = (
+    "https://api.ipify.org",
+    "https://checkip.amazonaws.com",
+    "https://icanhazip.com",
+    "https://ifconfig.co/ip",
+)
+GEO_ENDPOINTS = ("https://ip-info.com/json", "https://api.ipapi.is/")
+
+# Snapshot of Anthropic's Supported Regions Policy effective 2026-11-12.
+# The policy says that any country/region not listed is unsupported. We use
+# an allowlist (rather than a partial denylist) and fail closed when Throne
+# cannot provide a valid ISO 3166-1 alpha-2 country code for the tested egress IP.
+ANTHROPIC_SUPPORTED_COUNTRY_CODES = frozenset("""
+AL DZ AD AO AG AR AM AU AT AZ BS BH BD BB BE BZ BJ BT BO BA BW BR BN BG BF BI CV KH CM CA CF TD CL CO KM CG CD CR CI HR CY CZ DK DJ DM DO EC EG SV GQ ER EE SZ ET FJ FI FR GA GM GE DE GH GR GD GT GN GW GY HT HN HU IS IN ID IQ IE IL IT JM JP JO KZ KE KI KW KG LA LV LB LS LR LY LI LT LU MG MW MY MV ML MT MH MR MU MX FM MD MC MN ME MA MZ NA NR NP NL NZ NI NE NG MK NO OM PK PW PS PA PG PY PE PH PL PT QA RO RW KN LC VC WS SM ST SA SN RS SC SL SG SK SI SO SB ZA KR SS ES LK SD SR SE CH TW TJ TZ TH TL TG TO TT TN TR TM TV UG UA AE GB US UY UZ VU VA VN ZM ZW
+""".split())
+
+# Anthropic explicitly says that territories and dependencies of a supported
+# country are supported. Include common ISO-coded dependencies/territories.
+ANTHROPIC_SUPPORTED_TERRITORY_CODES = frozenset("""
+AI AS AX AW BM BQ BV CC CK CW CX FO FK GF GG GI GL GP GU HM IM IO JE KY
+MF MP MQ MS NC NF NU PF PM PN PR RE SH SJ SX TC TF TK UM VG VI WF YT GS
+""".split())
+
+# Ukraine is listed as supported except Crimea, Donetsk, Kherson, Luhansk and
+# Zaporizhzhia. Throne exposes only a country code, not sub-country region;
+# exclude all UA egress conservatively because this app cannot verify the carve-out.
+COUNTRIES_WITH_UNVERIFIABLE_REGIONAL_EXCLUSIONS = frozenset({"UA"})
+COUNTRY_LABELS = {
+    "RU": "Russia", "IR": "Iran", "CN": "China", "BY": "Belarus",
+    "AF": "Afghanistan", "KP": "North Korea", "SY": "Syria", "CU": "Cuba",
+    "VE": "Venezuela", "HK": "Hong Kong", "MO": "Macao", "XK": "Kosovo",
+    "UA": "Ukraine",
+}
+PRE_RESOLVED: dict[str, list[str]] = {}
+DNS_OVER_TLS_DETECTED = False
+
+HOME = Path.home()
+XDG_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
+XDG_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state"))
+CONFIG_DIR = XDG_CONFIG_HOME / "vpn-manager"
+STATE_DIR = XDG_STATE_HOME / "vpn-manager"
+TIMEZONE_STATE_DIR = XDG_STATE_HOME / "vpn-timezone"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+ORIGINAL_TZ_FILE = TIMEZONE_STATE_DIR / "original-timezone"
+SESSION_FILE = STATE_DIR / "session.json"
+LOCK_FILE = STATE_DIR / "manager.lock"
+KEY_DEFAULT = XDG_CONFIG_HOME / "throne" / "api-key"
+LOG_DIR = STATE_DIR / "logs"
+LOG_FILE: Path | None = None
+
+
+class ManagerError(RuntimeError):
+    pass
+
+
+def now_text() -> str:
+    return dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def init_dirs() -> None:
+    global LOG_FILE
+    for path in (CONFIG_DIR, STATE_DIR, TIMEZONE_STATE_DIR, LOG_DIR):
+        path.mkdir(parents=True, exist_ok=True)
+        try:
+            path.chmod(0o700)
+        except OSError:
+            pass
+    LOG_FILE = LOG_DIR / (dt.datetime.now().strftime("%Y%m%d-%H%M%S") + ".log")
+    LOG_FILE.touch(mode=0o600, exist_ok=True)
+    try:
+        LOG_FILE.chmod(0o600)
+    except OSError:
+        pass
+
+
+def log(message: str = "", level: str = "INFO") -> None:
+    print(message, flush=True)
+    if LOG_FILE:
+        try:
+            with LOG_FILE.open("a", encoding="utf-8") as f:
+                f.write(f"[{now_text()}] [{level}] {message}\n")
+        except OSError:
+            pass
+
+
+def section(title: str) -> None:
+    log("\n" + "=" * 68)
+    log(title)
+    log("=" * 68)
+
+
+def run_cmd(
+    argv: list[str], *, timeout: int = 60,
+    env: dict[str, str] | None = None, show_output: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(
+            argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=timeout, env=env, check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        output = exc.stdout or ""
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", "replace")
+        return subprocess.CompletedProcess(argv, 124, output + "\nCommand timed out.")
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(argv, 127, f"Command not found: {argv[0]}")
+
+    output = (result.stdout or "").strip()
+    if output and show_output:
+        for line in output.splitlines():
+            log("  " + line)
+    elif output and LOG_FILE:
+        with LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(f"[{now_text()}] [CMD] {' '.join(argv)}\n{output}\n")
+    return result
+
+
+def load_config() -> dict[str, Any]:
+    defaults: dict[str, Any] = {
+        "group_id": None,
+        "group_name": None,
+        "tun_interface": DEFAULT_TUN_IFACE,
+        "local_proxy_url": DEFAULT_LOCAL_PROXY_URL,
+        "max_profile_attempts": 20,
+        "latency_timeout_minutes": 20,
+        "speed_test_top_n": 1,
+        "post_connect_grace_seconds": 8,
+        "public_ip_wait_seconds": 50,
+    }
+    if not CONFIG_FILE.exists():
+        return defaults
+    try:
+        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("Configuration is not an object")
+        defaults.update(data)
+        return defaults
+    except Exception as exc:
+        raise ManagerError(f"The configuration file is corrupted or unreadable: {CONFIG_FILE}\n{exc}")
+
+
+def save_config(config: dict[str, Any]) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    temp = CONFIG_FILE.with_suffix(".tmp")
+    temp.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temp.chmod(0o600)
+    os.replace(temp, CONFIG_FILE)
+
+
+def write_session(data: dict[str, Any]) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    temp = SESSION_FILE.with_suffix(".tmp")
+    temp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temp.chmod(0o600)
+    os.replace(temp, SESSION_FILE)
+
+
+def read_session() -> dict[str, Any] | None:
+    if not SESSION_FILE.is_file():
+        return None
+    try:
+        data = json.loads(SESSION_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception as exc:
+        raise ManagerError(f"The session state file is unreadable: {SESSION_FILE}\n{exc}")
+
+
+def clear_session() -> None:
+    try:
+        SESSION_FILE.unlink(missing_ok=True)
+    except OSError as exc:
+        raise ManagerError(f"The connection was stopped, but removing the session state file failed: {exc}")
+
+
+def mark_session_verified() -> None:
+    """Mark the bootstrap complete so future Start calls never restart the live TUN."""
+    session = read_session()
+    if not session:
+        raise ManagerError("The pinned session file was not found; cannot mark the session as verified.")
+    session["phase"] = "verified"
+    session["verified_at"] = now_text()
+    write_session(session)
+
+
+def input_prefilled(prompt: str, default: str) -> str:
+    try:
+        readline.set_startup_hook(lambda: readline.insert_text(default))
+        return input(prompt)
+    finally:
+        readline.set_startup_hook(None)
+
+
+def read_key() -> str:
+    if not sys.stdin.isatty():
+        return input("Selection (number): ").strip()
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+        if ch == "\x1b":
+            return ch + sys.stdin.read(2)
+        if ch in ("\r", "\n"):
+            return "ENTER"
+        return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def choose_menu(title: str, options: list[str]) -> int:
+    selected = 0
+    while True:
+        if sys.stdout.isatty():
+            print("\033[2J\033[H", end="")
+        print(title)
+        print("-" * len(title))
+        for i, option in enumerate(options):
+            marker = "❯" if i == selected else " "
+            print(f"\033[1;32m {marker} {option}\033[0m" if i == selected else f"   {option}")
+        print("\nUse the Up/Down arrow keys and press Enter to select; press q to quit.")
+        key = read_key()
+        if key in ("\x1b[A", "\x1bOA"):
+            selected = (selected - 1) % len(options)
+        elif key in ("\x1b[B", "\x1bOB"):
+            selected = (selected + 1) % len(options)
+        elif key == "ENTER":
+            return selected
+        elif key.lower() == "q":
+            return len(options) - 1
+        elif key.isdigit() and key:
+            n = int(key) - 1
+            if 0 <= n < len(options):
+                return n
+
+
+class ThroneClient:
+    def __init__(self, *, allow_key_prompt: bool = True) -> None:
+        self.addr = os.environ.get("THRONE_ADDR", DEFAULT_THRONE_ADDR)
+        self.env = os.environ.copy()
+        self.key_file: Path | None = None
+        env_key_file = self.env.get("THRONE_KEY_FILE", "").strip()
+        env_key = self.env.get("THRONE_KEY", "").strip()
+        if env_key:
+            self.env["THRONE_KEY"] = env_key
+        else:
+            candidate = Path(env_key_file).expanduser() if env_key_file else KEY_DEFAULT
+            if candidate.is_file() and os.access(candidate, os.R_OK):
+                self.key_file = candidate
+            elif allow_key_prompt:
+                self.configure_key()
+            else:
+                raise ManagerError(f"Throne API key file not found: {candidate}")
+
+    def configure_key(self) -> None:
+        log("The API key is unavailable. In Throne, open Settings → Integration Settings → Throne API and select Copy for scripts.")
+        secret = getpass.getpass("Throne API key: ").strip()
+        if secret.startswith("THRONE_KEY="):
+            secret = secret.split("=", 1)[1].strip().strip("\"'")
+        if len(secret) < 32:
+            raise ManagerError("The provided API key is too short. Copy the API key again.")
+        KEY_DEFAULT.parent.mkdir(parents=True, exist_ok=True)
+        KEY_DEFAULT.parent.chmod(0o700)
+        KEY_DEFAULT.write_text(secret + "\n", encoding="utf-8")
+        KEY_DEFAULT.chmod(0o600)
+        self.key_file = KEY_DEFAULT
+        log(f"API key saved to the private path: {KEY_DEFAULT}")
+
+    def command(self, args: list[str], *, timeout: int = 60, json_output: bool = False,
+                show_output: bool = True) -> subprocess.CompletedProcess[str]:
+        base = ["thronectl", "--addr", self.addr]
+        if self.key_file:
+            base += ["--key-file", str(self.key_file)]
+        if json_output:
+            base += ["--json"]
+        return run_cmd(base + args, timeout=timeout, env=self.env, show_output=show_output)
+
+    def json_api(self, method: str, path: str, *query: str) -> dict[str, Any]:
+        result = self.command(["call", method, path, *query], timeout=30,
+                              json_output=True, show_output=False)
+        if result.returncode != 0:
+            raise ManagerError(f"Throne API request failed ({method} {path}):\n{result.stdout.strip()}")
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise ManagerError(f"The API response is unreadable ({method} {path}): {exc}\n{result.stdout[:1000]}")
+        if not isinstance(data, dict):
+            raise ManagerError(f"Unexpected API response structure ({method} {path}).")
+        return data
+
+
+def timedatectl_timezone() -> str:
+    result = run_cmd(["timedatectl", "show", "-p", "Timezone", "--value"], timeout=10, show_output=False)
+    if result.returncode != 0:
+        raise ManagerError("Failed to read the current timezone using timedatectl.")
+    return result.stdout.strip()
+
+
+def valid_timezone(zone: str) -> bool:
+    result = run_cmd(["timedatectl", "list-timezones"], timeout=20, show_output=False)
+    return result.returncode == 0 and zone in set(result.stdout.splitlines())
+
+
+def ensure_original_timezone() -> str:
+    if ORIGINAL_TZ_FILE.is_file():
+        zone = ORIGINAL_TZ_FILE.read_text(encoding="utf-8").strip()
+        if not zone or not valid_timezone(zone):
+            raise ManagerError(f"The saved original timezone is invalid: {zone!r}\n{ORIGINAL_TZ_FILE}")
+        return zone
+    section("Save the system’s original timezone")
+    current = timedatectl_timezone()
+    default = "Asia/Tehran" if valid_timezone("Asia/Tehran") else current
+    log(f"Current system timezone: {current}")
+    log("Enter the original timezone. The suggested value is Asia/Tehran; you can edit it.")
+    zone = input_prefilled("Original timezone: ", default).strip() or default
+    if not valid_timezone(zone):
+        raise ManagerError(f"Invalid timezone: {zone}")
+    ORIGINAL_TZ_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temp = ORIGINAL_TZ_FILE.with_suffix(".tmp")
+    temp.write_text(zone + "\n", encoding="utf-8")
+    temp.chmod(0o600)
+    os.replace(temp, ORIGINAL_TZ_FILE)
+    log(f"Original timezone saved: {zone}")
+    return zone
+
+
+def restore_original_timezone(*, required: bool = False) -> bool:
+    if not ORIGINAL_TZ_FILE.is_file():
+        message = "The original timezone has not been saved; automatic restoration is unavailable."
+        if required:
+            raise ManagerError(message)
+        log(message, "WARN")
+        return False
+    zone = ORIGINAL_TZ_FILE.read_text(encoding="utf-8").strip()
+    if not valid_timezone(zone):
+        message = f"The saved original timezone is invalid: {zone!r}"
+        if required:
+            raise ManagerError(message)
+        log(message, "ERROR")
+        return False
+    current = timedatectl_timezone()
+    if current != zone:
+        result = run_cmd(["sudo", "timedatectl", "set-timezone", zone], timeout=120)
+        if result.returncode != 0:
+            if required:
+                raise ManagerError("Failed to restore the original timezone.")
+            log("Failed to restore the original timezone.", "ERROR")
+            return False
+    final = timedatectl_timezone()
+    if final != zone:
+        if required:
+            raise ManagerError(f"Final timezone verification failed; current value is {final}.")
+        log(f"Final timezone verification failed; current value is {final}.", "ERROR")
+        return False
+    log(f"Original timezone restored: {zone}")
+    return True
+
+
+def get_status(client: ThroneClient) -> dict[str, Any]:
+    return client.json_api("GET", "/v1/status")
+
+
+def get_settings(client: ThroneClient) -> dict[str, Any]:
+    data = client.json_api("GET", "/v1/settings")
+    settings = data.get("settings")
+    if not isinstance(settings, dict):
+        raise ManagerError("The Throne settings structure is invalid.")
+    return settings
+
+
+def get_groups(client: ThroneClient) -> list[dict[str, Any]]:
+    data = client.json_api("GET", "/v1/groups")
+    return [g for g in data.get("groups", []) if isinstance(g, dict)]
+
+
+def get_profiles(client: ThroneClient, group_id: int | None = None) -> list[dict[str, Any]]:
+    query = [f"group={group_id}"] if group_id is not None else []
+    data = client.json_api("GET", "/v1/profiles", *query)
+    return [p for p in data.get("profiles", []) if isinstance(p, dict)]
+
+
+def active_profile(status: dict[str, Any]) -> dict[str, Any] | None:
+    profile = status.get("profile")
+    if isinstance(profile, dict) and profile.get("id") is not None:
+        return profile
+    return None
+
+
+def wait_status_idle(client: ThroneClient, timeout: int = 30) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    last: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        last = get_status(client)
+        if last.get("state") == "idle" and active_profile(last) is None:
+            return last
+        time.sleep(1)
+    return last
+
+
+def wait_stably_idle(client: ThroneClient, *, timeout: int = 25, stable_seconds: int = 4) -> dict[str, Any] | None:
+    """Require IDLE with no active profile continuously before another startup candidate is tried."""
+    deadline = time.monotonic() + timeout
+    stable_since: float | None = None
+    last: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        last = get_status(client)
+        idle = last.get("state") == "idle" and active_profile(last) is None
+        if idle:
+            if stable_since is None:
+                stable_since = time.monotonic()
+            elif time.monotonic() - stable_since >= stable_seconds:
+                return last
+        else:
+            stable_since = None
+        time.sleep(1)
+    return None
+
+
+def wait_kill_switch_armed(client: ThroneClient, timeout: int = 45) -> tuple[bool, str]:
+    deadline = time.monotonic() + timeout
+    last_state, last_error = "unknown", ""
+    while time.monotonic() < deadline:
+        status = get_status(client)
+        last_state = str(status.get("kill_switch", "unknown")).lower()
+        last_error = str(status.get("kill_switch_error") or "")
+        if last_state == "armed":
+            return True, ""
+        if last_state == "failed":
+            return False, last_error or "Throne reported that the Kill Switch failed."
+        time.sleep(1.5)
+    return False, f"Kill Switch did not reach the armed state within {timeout} seconds (state: {last_state}; error: {last_error or 'no details'})."
+
+
+def set_kill_switch(client: ThroneClient, enabled: bool) -> None:
+    result = client.command(["settings", "set", f"kill_switch={'true' if enabled else 'false'}"], timeout=90)
+    if result.returncode != 0:
+        raise ManagerError(f"Failed to set Kill Switch to {'ON' if enabled else 'OFF'}.\n{result.stdout.strip()}")
+
+
+def ensure_original_timezone_is_saved_for_stop() -> str | None:
+    if not ORIGINAL_TZ_FILE.is_file():
+        log("The original timezone is not saved. Network cleanup will continue, but the timezone cannot be restored automatically.", "WARN")
+        return None
+    zone = ORIGINAL_TZ_FILE.read_text(encoding="utf-8").strip()
+    if not valid_timezone(zone):
+        log(f"The saved original timezone is invalid: {zone!r}", "ERROR")
+        return None
+    return zone
+
+
+def choose_group(client: ThroneClient, config: dict[str, Any], force: bool = False) -> int:
+    groups = [g for g in get_groups(client) if g.get("subscription") and not g.get("archived")]
+    if not groups:
+        raise ManagerError("No active subscription groups were found in Throne.")
+    saved_id = config.get("group_id")
+    if not force and saved_id is not None:
+        for group in groups:
+            if int(group.get("id", -1)) == int(saved_id):
+                config["group_name"] = group.get("name", "")
+                return int(saved_id)
+    print("\nSelect the subscription group whose profiles should be evaluated for server selection:")
+    for index, group in enumerate(groups, 1):
+        print(f"  {index}. {group.get('name', 'Unnamed')} | {group.get('profile_count', 0)} profiles | ID {group.get('id')}")
+    while True:
+        raw = input("Group number: ").strip()
+        if raw.isdigit() and 1 <= int(raw) <= len(groups):
+            selected = groups[int(raw) - 1]
+            config["group_id"] = int(selected["id"])
+            config["group_name"] = selected.get("name", "")
+            save_config(config)
+            return int(selected["id"])
+        log("Invalid selection.", "WARN")
+
+
+def profile_type_by_id(client: ThroneClient, profile_id: int, known: dict[str, Any] | None = None) -> str:
+    if known and known.get("type"):
+        return str(known.get("type"))
+    for profile in get_profiles(client):
+        if int(profile.get("id", -1)) == profile_id:
+            return str(profile.get("type", "unknown"))
+    return "unknown"
+
+
+def is_dynamic_selector(profile_type: str) -> bool:
+    value = profile_type.lower().replace("_", "").replace("-", "")
+    return "selector" in value or value in {"urltest", "auto"}
+
+
+def profile_candidates(profiles: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    static = []
+    for p in profiles:
+        if p.get("id") is None or is_dynamic_selector(str(p.get("type", ""))):
+            continue
+        static.append(p)
+
+    def rank(p: dict[str, Any]) -> tuple[int, int, str]:
+        latency = int(p.get("latency_ms", 0) or 0)
+        if latency > 0:
+            return (0, latency, str(p.get("name", "")))
+        if latency == -2:
+            return (1, 0, str(p.get("name", "")))
+        if latency == 0:
+            return (2, 0, str(p.get("name", "")))
+        return (3, 0, str(p.get("name", "")))
+
+    static.sort(key=rank)
+    return static[:max(1, limit)]
+
+
+def tun_interface_up(iface: str) -> bool:
+    if not Path("/sys/class/net", iface).exists():
+        return False
+    result = run_cmd(["ip", "-o", "link", "show", "dev", iface], timeout=10, show_output=False)
+    return result.returncode == 0 and bool(re.search(r"<[^>]*\bUP\b[^>]*>", result.stdout))
+
+
+def resolve_endpoints_before_vpn() -> None:
+    """Resolve check/GeoIP hosts while the normal network is still available.
+
+    The resulting addresses let curl use --resolve after TUN and Kill Switch
+    are enabled, avoiding a dependency on system DNS during VPN bootstrap.
+    """
+    PRE_RESOLVED.clear()
+    hosts = [urlsplit(url).hostname for url in (*IP_CHECK_ENDPOINTS, *GEO_ENDPOINTS)]
+    for host in dict.fromkeys(h for h in hosts if h):
+        result = run_cmd(["getent", "ahostsv4", host], timeout=7, show_output=False)
+        addresses: list[str] = []
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                fields = line.split()
+                if not fields:
+                    continue
+                try:
+                    ip = ipaddress.ip_address(fields[0])
+                    if ip.version == 4 and ip.is_global and str(ip) not in addresses:
+                        addresses.append(str(ip))
+                except ValueError:
+                    continue
+        PRE_RESOLVED[host] = addresses[:4]
+        if addresses:
+            log(f"Pre-VPN DNS for {host}: {', '.join(addresses[:4])}")
+        else:
+            log(f"Pre-VPN DNS for {host} could not be resolved; DNS/proxy fallbacks will be tried later.", "WARN")
+
+
+def _curl_text(
+    url: str, *, proxy_url: str | None = None, headers: list[str] | None = None,
+    connect_timeout: int = 5, max_time: int = 8, retries: int = 0,
+    resolve_ip: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Fetch a small response. resolve_ip bypasses local DNS for direct TUN tests."""
+    argv = [
+        "curl", "-4", "-fsS", "--connect-timeout", str(connect_timeout),
+        "--max-time", str(max_time),
+    ]
+    if retries > 0:
+        argv += ["--retry", str(retries), "--retry-all-errors", "--retry-delay", "1"]
+    if proxy_url:
+        argv += ["--proxy", proxy_url, "--noproxy", ""]
+    else:
+        argv += ["--noproxy", "*"]
+        host = urlsplit(url).hostname
+        if resolve_ip and host:
+            argv += ["--resolve", f"{host}:443:{resolve_ip}"]
+    for header in headers or []:
+        argv += ["-H", header]
+    argv.append(url)
+    return run_cmd(argv, timeout=max_time + connect_timeout + 5, show_output=False)
+
+
+def _parse_global_ip(output: str) -> str | None:
+    value = output.strip().splitlines()[0].strip() if output.strip() else ""
+    try:
+        parsed = ipaddress.ip_address(value)
+        return str(parsed) if parsed.is_global else None
+    except ValueError:
+        return None
+
+
+def check_system_dns() -> bool:
+    """Verify that normal hostname lookups work after the TUN DNS workaround."""
+    deadline = time.monotonic() + 12
+    last_error = ""
+    while time.monotonic() < deadline:
+        result = run_cmd(["getent", "ahostsv4", "example.com"], timeout=5, show_output=False)
+        if result.returncode == 0 and result.stdout.strip():
+            log("The system DNS check succeeded after connecting.")
+            return True
+        last_error = (result.stdout or "DNS lookup failed").strip()[-160:]
+        time.sleep(2)
+    log(
+        "Warning: The public IP is reachable through TUN, but normal system DNS resolution is still failing. "
+        "Some applications may not be able to resolve domain names. Check the Remote DNS and Direct DNS settings in Throne. "
+        f"Last error: {last_error}",
+        "WARN",
+    )
+    return False
+
+
+def public_ip(
+    proxy_url: str | None = DEFAULT_LOCAL_PROXY_URL, *,
+    client: ThroneClient | None = None, pinned_id: int | None = None,
+    iface: str | None = None, wait_seconds: int = 50,
+    grace_seconds: int = 8,
+) -> str | None:
+    """Verify actual system/TUN egress with warm-up, DNS pinning and bounded retries."""
+    log(f"Waiting {grace_seconds} seconds after connecting for TUN and DNS routing to become ready...")
+    time.sleep(max(0, grace_seconds))
+    deadline = time.monotonic() + max(10, wait_seconds)
+    round_no = 0
+    last_proxy_ip: str | None = None
+    while time.monotonic() < deadline:
+        round_no += 1
+        if client is not None and pinned_id is not None:
+            profile, status = profile_running_now(client)
+            if not profile or int(profile.get("id", -1)) != pinned_id or status.get("state") != "running":
+                raise ManagerError(
+                    f"The pinned profile state changed during network verification (ID {pinned_id}). "
+                    "No profile switch will be attempted. Run --stop to end the session safely."
+                )
+            if str(status.get("kill_switch", "")).lower() != "armed":
+                raise ManagerError("Kill Switch is no longer armed during public IP verification; the profile will not be changed.")
+        if iface and not tun_interface_up(iface):
+            log(f"Interface {iface} is not UP yet; waiting for TUN to become ready.", "WARN")
+            time.sleep(3)
+            continue
+
+        log(f"Direct TUN egress check, attempt {round_no}...")
+        for endpoint in IP_CHECK_ENDPOINTS:
+            host = urlsplit(endpoint).hostname or ""
+            addresses = PRE_RESOLVED.get(host, [])
+            # Rotate through DNS answers between rounds to avoid one stale CDN edge.
+            resolve_ip = addresses[(round_no - 1) % len(addresses)] if addresses else None
+            suffix = f" (DNS-pinned: {resolve_ip})" if resolve_ip else " (system DNS)"
+            log(f"Checking public IP through the direct system/TUN route: {endpoint}{suffix}")
+            result = _curl_text(
+                endpoint, connect_timeout=4, max_time=6, retries=0, resolve_ip=resolve_ip
+            )
+            if result.returncode == 0:
+                value = _parse_global_ip(result.stdout)
+                if value:
+                    log(f"Public IP verified through the direct system/TUN route: {value}")
+                    check_system_dns()
+                    return value
+                log(f"The direct route returned an invalid IP response: {result.stdout.strip()[:120] or 'empty response'}", "WARN")
+            else:
+                log(f"Direct request failed (exit={result.returncode}): {result.stdout.strip()[-180:]}", "WARN")
+
+        # One diagnostic proxy check per round. It does not replace TUN proof.
+        if proxy_url and round_no in (1, 3):
+            endpoint = IP_CHECK_ENDPOINTS[0]
+            log(f"Diagnostic check through the local Throne proxy: {endpoint}")
+            result = _curl_text(endpoint, proxy_url=proxy_url, connect_timeout=4, max_time=6, retries=0)
+            if result.returncode == 0:
+                last_proxy_ip = _parse_global_ip(result.stdout)
+                if last_proxy_ip:
+                    log(f"The local proxy returned an egress IP: {last_proxy_ip}; this does not replace TUN verification.", "WARN")
+            else:
+                log(f"The local proxy also failed to respond: {result.stdout.strip()[-180:]}", "WARN")
+
+        if time.monotonic() < deadline:
+            time.sleep(4)
+
+    if last_proxy_ip:
+        log(f"The local proxy is working (IP={last_proxy_ip}), but the direct TUN route was not verified. Auto Redirect, TUN, or DNS may be misconfigured.", "ERROR")
+    return None
+
+def fetch_geo(ip_expected: str, proxy_url: str | None = DEFAULT_LOCAL_PROXY_URL) -> tuple[str, str, str, str] | None:
+    routes: list[tuple[str, str | None]] = [("system/TUN", None)]
+    if proxy_url:
+        routes.append(("Throne local proxy", proxy_url))
+
+    for provider_url in GEO_ENDPOINTS:
+        provider = "IP Info" if "ip-info.com" in provider_url else "ipapi.is"
+        host = urlsplit(provider_url).hostname or ""
+        for route_name, proxy in routes:
+            addresses = PRE_RESOLVED.get(host, []) if proxy is None else []
+            attempts: list[str | None] = addresses[:3] if addresses else [None]
+            for resolve_ip in attempts:
+                route_suffix = f" DNS-pinned={resolve_ip}" if resolve_ip else ""
+                log(f"Detecting location and timezone using {provider} via {route_name}{route_suffix} ...")
+                result = _curl_text(
+                    provider_url, proxy_url=proxy,
+                    headers=["Accept: application/json", "User-Agent: vpn-manager/2.2"],
+                    connect_timeout=5, max_time=10, retries=0, resolve_ip=resolve_ip,
+                )
+                if result.returncode != 0:
+                    log(f"Service {provider} via {route_name} did not respond: {result.stdout.strip()[-180:]}", "WARN")
+                    continue
+                try:
+                    data = json.loads(result.stdout)
+                    got_ip = str(data.get("ip", "")).strip()
+                    tz = data.get("timezone")
+                    if isinstance(tz, dict):
+                        tz = tz.get("id") or tz.get("name")
+                    country = str(data.get("country_name") or data.get("country") or "Unknown")
+                    city = str(data.get("city") or "Unknown")
+                    tz = str(tz or "").strip()
+                    if got_ip != ip_expected:
+                        log(f"The IP returned by {provider} does not match the TUN egress IP; the response was rejected.", "WARN")
+                        continue
+                    ipaddress.ip_address(got_ip)
+                    if not tz or not valid_timezone(tz):
+                        log(f"A valid timezone was not returned by {provider}: {tz!r}", "WARN")
+                        continue
+                    log(f"Valid GeoIP data was returned by {provider} via {route_name}.")
+                    return provider, country, city, tz
+                except Exception as exc:
+                    log(f"Response from {provider} was unusable: {exc}", "WARN")
+    return None
+
+def sync_timezone(ip: str, proxy_url: str | None = DEFAULT_LOCAL_PROXY_URL) -> tuple[str, str, str, str]:
+    section("Timezone synchronization")
+    geo = fetch_geo(ip, proxy_url)
+    if not geo:
+        raise ManagerError("The VPN remains connected to the pinned profile, but the GeoIP service did not return a valid timezone. The timezone was not changed.")
+    provider, country, city, zone = geo
+    current = timedatectl_timezone()
+    log(f"VPN IP      : {ip}")
+    log(f"Country     : {country}")
+    log(f"City        : {city}")
+    log(f"IP Timezone : {zone}")
+    log(f"System TZ   : {current}")
+    if current != zone:
+        result = run_cmd(["sudo", "timedatectl", "set-timezone", zone], timeout=120)
+        if result.returncode != 0:
+            raise ManagerError("The VPN connection was preserved, but applying the timezone with sudo failed.")
+    final_zone = timedatectl_timezone()
+    if final_zone != zone:
+        raise ManagerError(f"Expected timezone {zone}, but the system reported {final_zone}.")
+    log(f"Timezone synchronized with the VPN: {zone}")
+    return provider, country, city, zone
+
+
+def api_health(client: ThroneClient) -> None:
+    if shutil.which("thronectl") is None:
+        raise ManagerError("thronectl is not installed. Install the official Throne Linux package or a compatible thronectl binary.")
+    result = client.command(["status"], timeout=20)
+    if result.returncode != 0:
+        raise ManagerError("Could not connect to the Throne API. Check that Throne is running and Integration Settings → Throne API is enabled.\n" + result.stdout.strip())
+
+
+def diagnose_linux_dns() -> bool:
+    """Inspect systemd-resolved before TUN; return whether DNS-over-TLS is enabled."""
+    global DNS_OVER_TLS_DETECTED
+    DNS_OVER_TLS_DETECTED = False
+    if shutil.which("resolvectl") is None:
+        log("resolvectl is not installed; systemd-resolved diagnostics were skipped.", "WARN")
+        return False
+    result = run_cmd(["resolvectl", "status"], timeout=8, show_output=False)
+    if result.returncode != 0:
+        log("Could not read the systemd-resolved status; DNS settings will not be guessed.", "WARN")
+        return False
+    dot_lines = [line.strip() for line in result.stdout.splitlines() if "DNSOverTLS" in line]
+    for line in dot_lines[:8]:
+        log("systemd-resolved: " + line)
+    enabled = any(
+        re.search(r"DNSOverTLS(?:\s+setting)?:\s*yes", line, re.IGNORECASE)
+        for line in dot_lines
+    )
+    DNS_OVER_TLS_DETECTED = enabled
+    if enabled:
+        log(
+            "DNS over TLS is enabled on one of the links. Throne documentation notes that global DNSOverTLS in systemd-resolved can interfere with DNS over the Linux TUN interface; "
+            "after throne-tun is created, the application will set DNSOverTLS to no only for that interface and test again.",
+            "WARN",
+        )
+    return enabled
+
+
+def run_privileged_interactive(argv: list[str], *, timeout: int = 45) -> int:
+    """Run a sudo command with inherited terminal so its password prompt is visible."""
+    log("Running system command: " + " ".join(argv))
+    try:
+        result = subprocess.run(["sudo", *argv], timeout=timeout, check=False)
+        log(f"System command exited with code {result.returncode}.")
+        return result.returncode
+    except subprocess.TimeoutExpired:
+        log("The system command timed out.", "WARN")
+        return 124
+    except FileNotFoundError:
+        log("sudo or a required command could not be found.", "WARN")
+        return 127
+
+
+def configure_tun_dns(iface: str) -> bool:
+    """Apply Throne's documented systemd-resolved workaround to the TUN link only."""
+    if not shutil.which("resolvectl"):
+        log("resolvectl is unavailable; system DNS settings will not be changed automatically.", "WARN")
+        return False
+
+    deadline = time.monotonic() + 35
+    while time.monotonic() < deadline and not tun_interface_up(iface):
+        time.sleep(1)
+    if not tun_interface_up(iface):
+        log(f"Interface {iface} did not become UP within 35 seconds after connecting; interface DNS cannot be configured.", "WARN")
+        return False
+
+    log(f"TUN interface ({iface}) is ready; disabling DNSOverTLS only for this interface.")
+    rc = run_privileged_interactive(["resolvectl", "dnsovertls", iface, "no"], timeout=35)
+    if rc != 0:
+        log(
+            f"Could not apply DNSOverTLS settings to {iface}. This setting affects only the TUN interface; "
+            "global systemd-resolved settings were not changed.",
+            "WARN",
+        )
+        return False
+
+    # Clear negative/stale resolver cache entries after changing the per-link policy.
+    if shutil.which("resolvectl"):
+        run_cmd(["resolvectl", "flush-caches"], timeout=10, show_output=False)
+    time.sleep(2)
+    log(f"DNSOverTLS for interface {iface} was set to no; the DNS cache was also flushed.")
+    return True
+
+
+def refresh_tun_same_profile_for_dns(client: ThroneClient, pinned_id: int, iface: str) -> None:
+    """Reapply a per-link DNS policy once during bootstrap, without changing profile ID."""
+    session = read_session() or {}
+    if session.get("tun_dns_refreshed"):
+        return
+    if session.get("phase") not in ("bootstrap-pinned", "connecting-pending"):
+        log("The session is already established; TUN will not be restarted to avoid interrupting your work.", "WARN")
+        return
+
+    profile, status = profile_running_now(client)
+    if (not profile or int(profile.get("id", -1)) != pinned_id
+            or status.get("state") != "running"
+            or str(status.get("kill_switch", "")).lower() != "armed"):
+        raise ManagerError("The pinned profile or Kill Switch was not in a safe state before applying the DNS fix; no other profile will be started.")
+
+    log("DNSOverTLS was enabled in systemd-resolved. To apply the documented setting, TUN will be restarted once during this initial setup only. The profile ID will remain unchanged and Kill Switch will stay enabled.", "WARN")
+    off = client.command(["tun", "off"], timeout=90)
+    if off.returncode != 0:
+        raise ManagerError("The one-time TUN restart required for the DNS fix did not start. The profile and Kill Switch remain unchanged.\n" + off.stdout.strip())
+
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        current_profile, current_status = profile_running_now(client)
+        if current_profile and int(current_profile.get("id", -1)) != pinned_id:
+            raise ManagerError("The profile ID changed while applying DNS settings; VPN Manager will not start another profile.")
+        if (current_profile and int(current_profile.get("id", -1)) == pinned_id
+                and current_status.get("state") == "running"
+                and not bool(current_status.get("tun"))):
+            break
+        time.sleep(1)
+    else:
+        raise ManagerError("Throne did not confirm that TUN was disabled for the DNS update. Kill Switch remains enabled.")
+
+    on = client.command(["tun", "on"], timeout=90)
+    if on.returncode != 0:
+        raise ManagerError("TUN could not be re-enabled after the DNS fix. Kill Switch remains enabled; run --stop for controlled recovery.\n" + on.stdout.strip())
+
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
+        current_profile, current_status = profile_running_now(client)
+        if current_profile and int(current_profile.get("id", -1)) != pinned_id:
+            raise ManagerError("After TUN was re-enabled, Throne reported a different profile; no further switching will be attempted.")
+        if (current_profile and int(current_profile.get("id", -1)) == pinned_id
+                and current_status.get("state") == "running"
+                and bool(current_status.get("tun")) and tun_interface_up(iface)):
+            break
+        time.sleep(1)
+    else:
+        raise ManagerError("The pinned profile did not return to running with TUN ON under the same ID after the TUN restart. Kill Switch remains enabled; run --stop to recover.")
+
+    # The interface may have been recreated; apply the per-link setting again.
+    if not configure_tun_dns(iface):
+        raise ManagerError("TUN was re-enabled, but the interface DNS settings could not be verified after recreation. Kill Switch remains enabled; run --stop to recover.")
+    session = read_session() or {}
+    session["tun_dns_refreshed"] = True
+    write_session(session)
+    log(f"TUN is ready again with the same profile {pinned_id}; the DNS fix was applied and verified.")
+
+
+def update_subscriptions(client: ThroneClient) -> tuple[bool, str]:
+    section("Update subscriptions")
+    log("Updating all subscription groups...")
+    result = client.command(["--timeout", "20m", "sub", "update", "--all"], timeout=1250)
+    output = result.stdout.strip()
+    if result.returncode == 0:
+        log("Subscription update command completed successfully.")
+        return True, output
+    log("The update was incomplete; continuing with the profiles currently available in Throne.", "WARN")
+    if output:
+        log(output, "WARN")
+    return False, output
+
+
+def test_latency(client: ThroneClient, group_id: int, timeout_minutes: int) -> bool:
+    section("Profile latency test")
+    log("Latency Test evaluates profiles without changing the system’s active profile.")
+    result = client.command(
+        ["--timeout", f"{max(1, timeout_minutes)}m", "test", "latency", "--group", str(group_id)],
+        timeout=max(90, timeout_minutes * 60 + 15), show_output=True,
+    )
+    if result.returncode == 0:
+        log("Latency Test completed.")
+        return True
+    log("Latency Test did not complete; using the latest saved results and group order.", "WARN")
+    return False
+
+
+def country_label(code: str) -> str:
+    return COUNTRY_LABELS.get(code, code)
+
+
+def is_anthropic_supported_egress(country_value: Any) -> tuple[bool, str, str]:
+    """Return (allowed, ISO alpha-2 code, reason) using the official allowlist."""
+    code = str(country_value or "").strip().upper()
+    if not re.fullmatch(r"[A-Z]{2}", code):
+        return False, code, "country code missing or invalid; region cannot be verified"
+    if code in COUNTRIES_WITH_UNVERIFIABLE_REGIONAL_EXCLUSIONS:
+        return False, code, (
+            "Ukraine is conservatively excluded because Throne reports country-level data only "
+            "and cannot distinguish the regions excluded by Anthropic's policy"
+        )
+    if code in ANTHROPIC_SUPPORTED_COUNTRY_CODES or code in ANTHROPIC_SUPPORTED_TERRITORY_CODES:
+        return True, code, "listed as a supported country/territory by Anthropic"
+    return False, code, "not present in Anthropic's Supported Regions allowlist"
+
+
+def _job_results_from_cli(output: str) -> list[dict[str, Any]]:
+    """Read the finished Throne IP-test Job; never trust stale profile fields."""
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise ManagerError(
+            "Throne's IP Test did not return machine-readable Job data. "
+            "The country filter cannot safely use cached profile results."
+        ) from exc
+    if isinstance(payload, dict) and isinstance(payload.get("job"), dict):
+        payload = payload["job"]
+    if not isinstance(payload, dict) or payload.get("kind") != "ip":
+        raise ManagerError("Throne's IP Test response is not a valid IP-test Job.")
+    if payload.get("state") != "done":
+        raise ManagerError(f"Throne's IP Test did not finish successfully (state={payload.get('state')!r}).")
+    results = payload.get("results")
+    if not isinstance(results, list):
+        raise ManagerError("Throne's IP Test Job has no per-profile results; cached country data will not be trusted.")
+    return [item for item in results if isinstance(item, dict)]
+
+
+def test_ip_and_filter(client: ThroneClient, group_id: int, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Test actual egress IP/country and allow only Anthropic-supported regions."""
+    section("Verify egress IP and filter unsupported regions")
+    ids = [int(p["id"]) for p in candidates if p.get("id") is not None]
+    if not ids:
+        raise ManagerError("No profiles are available for IP testing.")
+    log(
+        "Running Throne's native per-profile IP test. Candidate eligibility is based on the tested egress IP country, "
+        "not the profile name, flag, or server hostname."
+    )
+    log(
+        "Region policy: Anthropic Supported Regions Policy effective 2026-11-12. "
+        "Countries/territories outside the official supported list, and unknown countries, are rejected."
+    )
+    result = client.command(
+        ["--timeout", "5m", "test", "ip", *[str(x) for x in ids]],
+        timeout=335, json_output=True, show_output=False,
+    )
+    if result.returncode != 0:
+        log("Throne's built-in IP test did not complete: " + result.stdout.strip()[-300:], "WARN")
+        raise ManagerError(
+            "Throne could not complete the per-profile IP test. No connection was started because the actual exit country "
+            "cannot be verified. Check Throne's IP Test and logs."
+        )
+
+    tested_profiles = _job_results_from_cli(result.stdout)
+    by_id = {int(p.get("id", -1)): p for p in tested_profiles if p.get("id") is not None}
+    candidate_by_id = {int(p["id"]): p for p in candidates if p.get("id") is not None}
+    eligible: list[dict[str, Any]] = []
+    rejected: list[str] = []
+
+    for pid in ids:
+        tested = by_id.get(pid)
+        original = candidate_by_id.get(pid, {})
+        name = str((tested or original).get("name", f"Profile {pid}"))
+        if tested is None:
+            reason = "no result returned by this IP-test Job"
+            log(f"REJECTED: ID {pid} | {name} | {reason}", "WARN")
+            rejected.append(f"{name} (ID {pid}: {reason})")
+            continue
+
+        raw_ip = str(tested.get("ip_out", "")).strip()
+        valid_ip = _parse_global_ip(raw_ip)
+        if not valid_ip:
+            reason = "IP Test did not return a valid public egress IP"
+            log(f"REJECTED: ID {pid} | {name} | {reason}", "WARN")
+            rejected.append(f"{name} (ID {pid}: {reason})")
+            continue
+
+        allowed, country_code, reason = is_anthropic_supported_egress(tested.get("country"))
+        tested_country = country_label(country_code) if country_code else "Unknown"
+        if not allowed:
+            log(
+                f"REJECTED: ID {pid} | {name} | egress={valid_ip} | country={tested_country} "
+                f"({country_code or 'NO CODE'}) | {reason}",
+                "WARN",
+            )
+            rejected.append(f"{name} (ID {pid}: {tested_country} / {country_code or 'unknown'})")
+            continue
+
+        merged = dict(original)
+        merged.update(tested)
+        merged["ip_out"] = valid_ip
+        merged["country"] = country_code
+        eligible.append(merged)
+        log(
+            f"ELIGIBLE: ID {pid} | {name} | egress={valid_ip} | "
+            f"country={tested_country} ({country_code})"
+        )
+
+    log(f"Region filter result: {len(eligible)} eligible, {len(rejected)} rejected out of {len(ids)} tested profile(s).")
+    if rejected:
+        for item in rejected:
+            log(f"Excluded profile: {item}", "WARN")
+    if not eligible:
+        raise ManagerError(
+            "No eligible profiles remain. Every candidate either had no verifiable egress country/IP or its egress region "
+            "was not on Anthropic's Supported Regions allowlist. No VPN profile was connected and Kill Switch was not enabled."
+        )
+    return eligible
+
+
+def test_speed_and_rank(client: ThroneClient, group_id: int, candidates: list[dict[str, Any]], top_n: int) -> list[dict[str, Any]]:
+    """Benchmark a small pre-session pool; never changes the active connection."""
+    if top_n <= 0 or not candidates:
+        return candidates
+    pool = [p for p in candidates if int(p.get("latency_ms", 0) or 0) > 0][:top_n]
+    if not pool:
+        pool = candidates[:top_n]
+    ids = [int(p["id"]) for p in pool]
+    log(f"Pre-session download speed test on {len(ids)} candidate(s): {', '.join(map(str, ids))}")
+    result = client.command(
+        ["--timeout", "15m", "test", "speed", *[str(x) for x in ids]],
+        timeout=950, json_output=True, show_output=False,
+    )
+    refreshed = get_profiles(client, group_id)
+    by_id = {int(p.get("id", -1)): p for p in refreshed if p.get("id") is not None}
+    updated = [by_id.get(int(p["id"]), p) for p in candidates]
+    measured = [p for p in updated if int(p.get("id", -1)) in set(ids)
+                and int(p.get("download_bps", 0) or 0) > 0]
+    if result.returncode == 0 and measured:
+        measured.sort(key=lambda p: int(p.get("download_bps", 0) or 0), reverse=True)
+        measured_ids = {int(p["id"]) for p in measured}
+        remaining = [p for p in updated if int(p.get("id", -1)) not in measured_ids]
+        best = measured[0]
+        log(f"Best pre-test speed: {int(best.get('download_bps', 0)) / 1_000_000:.2f} Mbps | {best.get('name', 'Unknown')}")
+        return measured + remaining
+    log("Speed test returned no usable result; ranking by latency was retained.", "WARN")
+    if result.stdout.strip():
+        log(result.stdout.strip(), "WARN")
+    return updated
+
+
+def save_pin(profile: dict[str, Any], *, phase: str, group_id: int | None) -> None:
+    write_session({
+        "version": 2,
+        "phase": phase,
+        "profile_id": int(profile["id"]),
+        "profile_name": str(profile.get("name", f"Profile {profile['id']}")),
+        "profile_type": str(profile.get("type", "unknown")),
+        "group_id": group_id,
+        "started_at": now_text(),
+        "policy": "single-static-profile-no-failover",
+        "tun_dns_refreshed": False,
+    })
+
+
+def profile_running_now(client: ThroneClient) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    status = get_status(client)
+    profile = active_profile(status)
+    if profile:
+        return profile, status
+    if status.get("state") == "running":
+        # Fallback for versions that omit the nested profile from status.
+        for item in get_profiles(client):
+            if item.get("running"):
+                return item, status
+    return None, status
+
+
+def wait_for_profile_result(client: ThroneClient, requested_id: int, timeout: int = 20) -> tuple[str, dict[str, Any] | None, dict[str, Any]]:
+    deadline = time.monotonic() + timeout
+    last_status: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        profile, last_status = profile_running_now(client)
+        state = str(last_status.get("state", "unknown"))
+        if profile and state == "running":
+            return "running", profile, last_status
+        if state == "idle" and profile is None:
+            return "idle", None, last_status
+        time.sleep(1)
+    profile, last_status = profile_running_now(client)
+    state = str(last_status.get("state", "unknown"))
+    if profile and state == "running":
+        return "running", profile, last_status
+    if state == "idle" and profile is None:
+        return "idle", None, last_status
+    return "pending", profile, last_status
+
+
+def ensure_tun_on(client: ThroneClient, pinned_id: int | None, iface: str) -> None:
+    status = get_status(client)
+    if not bool(status.get("tun")):
+        result = client.command(["tun", "on"], timeout=90)
+        if result.returncode != 0:
+            raise ManagerError("Failed to enable TUN. Check ThroneCore permissions and /dev/net/tun.\n" + result.stdout.strip())
+    deadline = time.monotonic() + 35
+    while time.monotonic() < deadline:
+        status = get_status(client)
+        current = active_profile(status)
+        if pinned_id is not None and current and int(current.get("id", -1)) != pinned_id:
+            raise ManagerError("The active profile ID changed after the TUN setting was modified. No other connection will be attempted; run vpn-manager --stop to restore normal operation.")
+        if bool(status.get("tun")) and (pinned_id is None or (current and int(current.get("id", -1)) == pinned_id and status.get("state") == "running")):
+            return
+        time.sleep(1)
+    if not bool(get_status(client).get("tun")):
+        raise ManagerError("Throne did not report TUN as enabled after the tun on command.")
+    if pinned_id is not None:
+        raise ManagerError("The original profile could not be verified after enabling TUN. No replacement profile will be started.")
+
+
+def activate_kill_switch(client: ThroneClient) -> None:
+    settings = get_settings(client)
+    if not bool(settings.get("kill_switch")):
+        set_kill_switch(client, True)
+    armed, error = wait_kill_switch_armed(client, timeout=50)
+    if not armed:
+        raise ManagerError("The profile remains connected and pinned, but Kill Switch did not become operational. No other VPN will be attempted. " + error)
+    log("Kill Switch is confirmed operational (armed).")
+
+
+def ensure_linux_auto_redirect(client: ThroneClient) -> None:
+    """Auto Redirect is required for Linux TUN traffic interception.
+
+    The setting is applied before TUN is enabled and before any profile runs.
+    It is deliberately not changed while a profile is active.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+    settings = get_settings(client)
+    value = settings.get("tun_auto_redirect")
+    if value is None:
+        raise ManagerError(
+            "The Throne API did not return tun_auto_redirect. To avoid enabling Kill Switch without a reliable TUN route, "
+            "the connection was not started. Check the Throne/API version."
+        )
+    if bool(value):
+        log("Tun Auto Redirect: ON (verified).")
+        return
+
+    status = get_status(client)
+    if status.get("state") != "idle" or active_profile(status) is not None:
+        raise ManagerError("Tun Auto Redirect is OFF, but Throne is not idle. Start was stopped to avoid changing settings during an active connection.")
+
+    if bool(status.get("tun")):
+        log("Tun Auto Redirect is OFF. TUN will first be disabled while no profile is active so the new setting can take effect from a clean state.", "WARN")
+        off = client.command(["tun", "off"], timeout=90)
+        if off.returncode != 0:
+            raise ManagerError("Failed to disable TUN to apply Auto Redirect; the Kill Switch and profile were not changed.\n" + off.stdout.strip())
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if not bool(get_status(client).get("tun")):
+                break
+            time.sleep(1)
+        if bool(get_status(client).get("tun")):
+            raise ManagerError("Throne did not confirm that TUN was disabled; Auto Redirect was not changed.")
+
+    log("Tun Auto Redirect was OFF; enabling it for correct TUN routing on Linux.", "WARN")
+    result = client.command(["settings", "set", "tun_auto_redirect=true"], timeout=60)
+    if result.returncode != 0 and "editing" in result.stdout.lower():
+        if sys.stdin.isatty():
+            log("The Throne Settings window is open. Close it, then press Enter to retry the setting change.", "WARN")
+            input("Have you closed Settings? Press Enter to continue: ")
+            result = client.command(["settings", "set", "tun_auto_redirect=true"], timeout=60)
+    if result.returncode != 0:
+        raise ManagerError(
+            "Failed to enable Tun Auto Redirect. Close the Settings window and run Start again.\n" + result.stdout.strip()
+        )
+    verified = get_settings(client)
+    if not bool(verified.get("tun_auto_redirect")):
+        raise ManagerError("Throne did not report tun_auto_redirect as enabled after the change; the connection was not started.")
+    log("Tun Auto Redirect is now ON and was verified before enabling TUN.")
+
+
+def start_with_candidates(client: ThroneClient, group_id: int, config: dict[str, Any], iface: str) -> tuple[dict[str, Any], dict[str, Any], bool]:
+    settings = get_settings(client)
+    status = get_status(client)
+    if bool(settings.get("kill_switch")) or str(status.get("kill_switch", "off")).lower() not in ("off", ""):
+        raise ManagerError("Kill Switch is already ON, but no connection is active. Run vpn-manager --stop first to restore normal networking; the application will not disable Kill Switch automatically.")
+
+    # A stale desktop proxy can block direct update requests when no profile is
+    # running. Clear it before the new session; Stop always normalizes it too.
+    if bool(status.get("system_proxy")):
+        proxy_result = client.command(["proxy", "off"], timeout=90)
+        if proxy_result.returncode != 0:
+            raise ManagerError("System Proxy remained enabled from the previous session and could not be disabled before starting a new connection.\n" + proxy_result.stdout.strip())
+
+    # Linux TUN requires Auto Redirect so system traffic is actually captured.
+    # Ensure it while no profile is running and before Kill Switch is armed.
+    ensure_linux_auto_redirect(client)
+
+    # Cache DNS answers before TUN/Kill Switch are enabled. This lets the
+    # post-connect TUN probe bypass a broken system resolver with curl --resolve.
+    resolve_endpoints_before_vpn()
+    dns_over_tls_detected = diagnose_linux_dns()
+    if dns_over_tls_detected:
+        log("DNSOverTLS is enabled; during connection setup, it will be overridden only for the TUN interface.", "WARN")
+
+    update_ok, _ = update_subscriptions(client)
+    if not update_ok:
+        log("Continuing with the current profile list; the subscription update error will remain in the final report.", "WARN")
+
+    test_latency(client, group_id, int(config.get("latency_timeout_minutes", 20) or 20))
+    profiles = get_profiles(client, group_id)
+    candidates = profile_candidates(profiles, int(config.get("max_profile_attempts", 20) or 20))
+    if not candidates:
+        raise ManagerError("This group contains no usable fixed profiles. Auto Selectors are intentionally excluded so the server cannot change during your session.")
+    candidates = test_ip_and_filter(client, group_id, candidates)
+    # A single speed sample keeps data use bounded; IP Test has already
+    # screened candidates for a real outbound IP.
+    candidates = test_speed_and_rank(
+        client, group_id, candidates, min(1, max(0, int(config.get("speed_test_top_n", 1) or 0)))
+    )
+
+    # Prepare TUN while no VPN profile is running. After benchmarking, arm
+    # Kill Switch before the first handshake so ordinary system traffic cannot
+    # escape while Throne establishes the selected connection. ThroneCore's
+    # own VPN-server connections are allowed by the official Kill Switch design.
+    tun_was_on = bool(get_status(client).get("tun"))
+    tun_result = client.command(["tun", "on"], timeout=90) if not tun_was_on else None
+    if tun_result and tun_result.returncode != 0:
+        raise ManagerError("Failed to enable TUN.\n" + tun_result.stdout.strip())
+    if not bool(get_status(client).get("tun")):
+        raise ManagerError("Throne did not confirm that TUN was enabled.")
+
+    # The candidate pool is already tested. Arm the guard before the first
+    # handshake so a slow or pending connection cannot expose direct traffic.
+    try:
+        activate_kill_switch(client)
+    except ManagerError:
+        if not tun_was_on:
+            client.command(["tun", "off"], timeout=90)
+        try:
+            set_kill_switch(client, False)
+        except ManagerError:
+            pass
+        raise
+
+    last_failure = ""
+    for index, candidate in enumerate(candidates, 1):
+        pid = int(candidate["id"])
+        name = str(candidate.get("name", f"Profile {pid}"))
+        latency = int(candidate.get("latency_ms", 0) or 0)
+        latency_label = f"{latency} ms" if latency > 0 else "No valid result"
+        log(f"Starting connection attempt [{index}/{len(candidates)}]: {name} | latency={latency_label}")
+        result = client.command(["--timeout", "3m", "connect", str(pid)], timeout=CONNECT_TIMEOUT)
+        outcome, running, state = wait_for_profile_result(client, pid, timeout=12)
+
+        if outcome == "running" and running:
+            actual_id = int(running.get("id", -1))
+            # The moment any profile reaches RUNNING, pin it. Never attempt another.
+            save_pin(running, phase="bootstrap-pinned", group_id=group_id)
+            if actual_id != pid:
+                log(f"Throne reported a different active profile (requested {pid}, active {actual_id}). The active connection will be preserved; no switch will be attempted.", "WARN")
+            else:
+                log(f"Profile connected and session pinned: {name} (ID {pid})")
+            return running, state, update_ok
+
+        if outcome == "pending":
+            pending_profile = {"id": pid, "name": name, "type": candidate.get("type", "unknown")}
+            save_pin(pending_profile, phase="connecting-pending", group_id=group_id)
+            try:
+                activate_kill_switch(client)
+            except ManagerError as exc:
+                log(f"Warning: Kill Switch could not be enabled for the pending connection: {exc}", "ERROR")
+            raise ManagerError(f"Connection state for {name} has not reached a final state. No other profile will be tried to prevent an unintended switch. Check Throne; run vpn-manager --stop to end the session safely.\n{result.stdout.strip()}")
+
+        # Retry during startup only after a continuously stable IDLE state.
+        # A transient IDLE or an ambiguous command result must never trigger a
+        # second connection attempt.
+        stable_idle = wait_stably_idle(client, timeout=25, stable_seconds=4)
+        if stable_idle is None:
+            pending_profile = {"id": pid, "name": name, "type": candidate.get("type", "unknown")}
+            save_pin(pending_profile, phase="connection-state-uncertain", group_id=group_id)
+            raise ManagerError(
+                f"Connection state for {name} is ambiguous, and Throne did not remain idle for four consecutive seconds. "
+                "No other candidate will be tried to prevent a second VPN connection. "
+                "Check the Throne state. Run vpn-manager --stop to end the session safely."
+            )
+        if result.returncode == 0:
+            pending_profile = {"id": pid, "name": name, "type": candidate.get("type", "unknown")}
+            save_pin(pending_profile, phase="connect-command-accepted-but-idle", group_id=group_id)
+            raise ManagerError(
+                f"The connect command for {name} returned a successful exit code, but Throne is still idle. "
+                "No other candidate will be tried to prevent a second connection. Check the Throne state first, then run --stop."
+            )
+        last_failure = result.stdout.strip() or f"connect returned {result.returncode}"
+        log(f"{name} did not reach RUNNING, and Throne remained idle for four consecutive seconds; this startup attempt failed. {last_failure}", "WARN")
+
+    # All attempts failed before any profile became RUNNING. The guard may
+    # now be safely removed because Throne is confirmed idle.
+    idle_status = wait_status_idle(client, timeout=20)
+    if idle_status.get("state") == "idle" and active_profile(idle_status) is None:
+        if not tun_was_on:
+            tun_off = client.command(["tun", "off"], timeout=90)
+            if tun_off.returncode != 0:
+                raise ManagerError("All profiles failed before connecting, and TUN could not be disabled. Do not turn off Kill Switch manually; run vpn-manager --stop to recover.")
+        try:
+            set_kill_switch(client, False)
+        except ManagerError as exc:
+            raise ManagerError(f"All profiles failed before connecting, but Kill Switch could not be disabled: {exc}. Run vpn-manager --stop to recover.")
+        deadline = time.monotonic() + 25
+        final_status: dict[str, Any] = {}
+        while time.monotonic() < deadline:
+            final_status = get_status(client)
+            if str(final_status.get("kill_switch", "unknown")).lower() == "off":
+                break
+            time.sleep(1)
+        if str(final_status.get("kill_switch", "unknown")).lower() != "off":
+            raise ManagerError("All profiles failed before connecting, but Kill Switch being disabled could not be verified. Network access may remain blocked; run vpn-manager --stop.")
+        if not tun_was_on and bool(final_status.get("tun")):
+            raise ManagerError("Kill Switch is OFF, but TUN is still ON despite the recovery attempt. Run vpn-manager --stop.")
+    else:
+        raise ManagerError("Connection failed, but Throne is not idle. Kill Switch will remain enabled to prevent traffic leaks. Use --stop to recover.")
+    raise ManagerError("No profile reached RUNNING. No active connection was established, and no profile was switched after a successful connection. Last error: " + last_failure)
+
+
+def verify_pinned_session(client: ThroneClient, pinned_id: int, iface: str, proxy_url: str | None) -> str:
+    profile, status = profile_running_now(client)
+    if not profile or str(status.get("state")) != "running":
+        raise ManagerError("The recorded connection is no longer RUNNING. VPN Manager will not replace the profile; run --stop to return to normal operation.")
+    actual_id = int(profile.get("id", -1))
+    if actual_id != pinned_id:
+        raise ManagerError(f"The active profile ID changed from {pinned_id} to {actual_id}. VPN Manager did not initiate this switch; it may have been changed in Throne or by another tool. Run --stop to end the session.")
+
+    # The TUN adapter may appear a few seconds after Throne reports RUNNING.
+    # Wait for the actual Linux link instead of failing immediately.
+    link_deadline = time.monotonic() + 35
+    while time.monotonic() < link_deadline and not tun_interface_up(iface):
+        current_profile, current_status = profile_running_now(client)
+        if (not current_profile or int(current_profile.get("id", -1)) != pinned_id
+                or current_status.get("state") != "running"):
+            raise ManagerError("The profile changed or left RUNNING while TUN was being prepared; no replacement connection will be started.")
+        time.sleep(1)
+    if not tun_interface_up(iface):
+        raise ManagerError(f"Profile {pinned_id} is active in Throne, but interface {iface} did not become UP within 35 seconds. No other profile will be tried.")
+
+    # On Debian/systemd-resolved, DNS-over-TLS on the TUN link is a documented
+    # cause of DNS failures. Set it to 'no' only on Throne's TUN link; do not
+    # modify the global resolver configuration.
+    dns_setting_applied = configure_tun_dns(iface)
+    if DNS_OVER_TLS_DETECTED and dns_setting_applied:
+        refresh_tun_same_profile_for_dns(client, pinned_id, iface)
+    ip = public_ip(
+        proxy_url, client=client, pinned_id=pinned_id, iface=iface,
+        wait_seconds=90, grace_seconds=12,
+    )
+    if not ip:
+        raise ManagerError(
+            f"Profile {pinned_id} is active and pinned, but obtaining a public IP through the direct system/TUN route failed even after waiting and using pre-resolved DNS. "
+            "No switch will be attempted; the session and Kill Switch will remain unchanged. "
+            "Most likely areas to investigate: Tun Auto Redirect, DNS over TLS in systemd-resolved, and Remote/Direct DNS in Throne. "
+            "All attempts are recorded in the log. To retry this same profile, run vpn-manager --start again; "
+            "the application will recheck the pinned profile and will not select another server."
+        )
+    return ip
+
+
+def start_session(client: ThroneClient, config: dict[str, Any], group_id: int | None) -> None:
+    section("Start VPN session with a pinned profile")
+    iface = str(config.get("tun_interface") or DEFAULT_TUN_IFACE)
+    proxy_url = str(config.get("local_proxy_url") or DEFAULT_LOCAL_PROXY_URL).strip() or None
+    existing_session = read_session()
+    if existing_session:
+        pinned = int(existing_session.get("profile_id", -1))
+        profile, status = profile_running_now(client)
+        if profile and int(profile.get("id", -1)) == pinned and status.get("state") == "running":
+            log(f"A session is already active: {existing_session.get('profile_name')} (ID {pinned}).")
+            log("Single-VPN policy: connection setup, profile tests, and subscription updates will not be repeated.")
+            log(f"TUN: {'ON' if status.get('tun') else 'OFF'} | Kill Switch: {status.get('kill_switch', 'unknown')}")
+            if not bool(status.get("tun")) or str(status.get("kill_switch", "")).lower() != "armed":
+                raise ManagerError("The pinned profile is active, but TUN or Kill Switch is not in the expected state. No changes were made to avoid restarting the connection; run --stop only to end the session.")
+            log("The session is already pinned. Only network and timezone verification for the same profile will be repeated. No selection tests or profile switches will occur.")
+            if (existing_session.get("phase") == "bootstrap-pinned"
+                    and not existing_session.get("tun_dns_refreshed")):
+                diagnose_linux_dns()
+            iface = str(config.get("tun_interface") or DEFAULT_TUN_IFACE)
+            proxy_url = str(config.get("local_proxy_url") or DEFAULT_LOCAL_PROXY_URL).strip() or None
+            ip = verify_pinned_session(client, pinned, iface, proxy_url)
+            provider, country, city, zone = sync_timezone(ip, proxy_url)
+            mark_session_verified()
+            finish_report(profile, ip, provider, country, city, zone, subscription_updated=False, reused=True)
+            return
+        raise ManagerError("A previous session file exists, but the pinned profile is no longer active or its ID has changed. Start was stopped to prevent another VPN from being selected; run vpn-manager --stop first.")
+
+    settings = get_settings(client)
+    status = get_status(client)
+    active = active_profile(status)
+
+    if active and status.get("state") == "running":
+        pid = int(active["id"])
+        ptype = profile_type_by_id(client, pid, active)
+        if is_dynamic_selector(ptype):
+            raise ManagerError(f"The active profile “{active.get('name', pid)}” is an Auto Selector and may change servers automatically. To guarantee a fixed server, disconnect it with vpn-manager --stop before running Start.")
+        if not bool(status.get("tun")):
+            raise ManagerError(f"A VPN is already active ({active.get('name', pid)}), but TUN is OFF. To avoid restarting and interrupting the existing connection, no changes were made. Run --stop, then Start to create a new session with TUN enabled.")
+        if not bool(settings.get("kill_switch")) or str(status.get("kill_switch", "off")).lower() != "armed":
+            raise ManagerError(
+                f"A profile is already active ({active.get('name', pid)}), but Kill Switch is not already armed. "
+                "Kill Switch was left unchanged to avoid restarting the existing connection. "
+                "Run vpn-manager --stop first, then Start."
+            )
+        # If the user already connected manually, capture the original timezone
+        # only after all safety checks; never mutate a live connection's modes.
+        original = ensure_original_timezone()
+        log(f"Saved original timezone: {original}")
+        save_pin(active, phase="pinned-existing", group_id=None)
+        log(f"Existing connection accepted and pinned: {active.get('name', pid)} (ID {pid}). No other profile will be selected.")
+        # Kill Switch is already armed; do not toggle it on a running profile,
+        # because Linux may restart Throne's core when its setting changes.
+        ip = verify_pinned_session(client, pid, iface, proxy_url)
+        provider, country, city, zone = sync_timezone(ip, proxy_url)
+        mark_session_verified()
+        finish_report(active, ip, provider, country, city, zone, subscription_updated=False, reused=True)
+        return
+
+    if status.get("state") != "idle" or active is not None:
+        raise ManagerError(f"Throne is in state {status.get('state')}; no other profile will be started until the current operation finishes.")
+
+    if bool(settings.get("kill_switch")) or str(status.get("kill_switch", "off")).lower() not in ("off", ""):
+        raise ManagerError("Kill Switch is ON, but no profile is active. Run vpn-manager --stop first to restore networking before starting a clean session.")
+
+    original = ensure_original_timezone()
+    log(f"Saved original timezone: {original}")
+    if group_id is None:
+        group_id = choose_group(client, config, force=True)
+    profile, connect_status, update_ok = start_with_candidates(client, group_id, config, iface)
+    pinned_id = int(profile["id"])
+
+    # From this point the profile is immutable for this session.
+    if read_session() is None:
+        save_pin(profile, phase="pinned", group_id=group_id)
+    ensure_tun_on(client, pinned_id, iface)
+    activate_kill_switch(client)
+    ip = verify_pinned_session(client, pinned_id, iface, proxy_url)
+    provider, country, city, zone = sync_timezone(ip, proxy_url)
+
+    current_profile, final_status = profile_running_now(client)
+    if not current_profile or int(current_profile.get("id", -1)) != pinned_id or final_status.get("state") != "running":
+        raise ManagerError("The profile ID does not match the pinned ID during final verification. No replacement was made; end the connection with --stop.")
+    if str(final_status.get("kill_switch", "")).lower() != "armed":
+        raise ManagerError("The profile is pinned, but Kill Switch is not armed. No profile switch will be attempted.")
+    mark_session_verified()
+    finish_report(profile, ip, provider, country, city, zone, subscription_updated=update_ok, reused=False)
+
+
+def finish_report(profile: dict[str, Any], ip: str, provider: str, country: str,
+                  city: str, zone: str, subscription_updated: bool | None, reused: bool) -> None:
+    section("Session report")
+    log("Status: VPN is connected and pinned to a single profile.")
+    log(f"Profile: {profile.get('name', 'Unknown')} (ID {profile.get('id')})")
+    log(f"Public IP: {ip}")
+    log(f"Location: {city}, {country}")
+    log(f"Timezone: {zone} (provider: {provider})")
+    log("TUN: ON | Kill Switch: ARMED")
+    if subscription_updated is True:
+        log("Subscription Update: completed before connecting")
+    elif subscription_updated is False:
+        log("Subscription Update: skipped because a VPN was already active")
+    else:
+        log("Subscription Update: attempted before connecting; see log for its result")
+    log("VPN switching during this session: DISABLED")
+    log("To end the session and restore the system to its normal state: vpn-manager --stop")
+
+
+def stop_session(client: ThroneClient | None) -> int:
+    section("Stop session and restore normal system state")
+    errors: list[str] = []
+    original_zone = ensure_original_timezone_is_saved_for_stop()
+    if not original_zone:
+        errors.append("The saved original timezone is unavailable. Network cleanup will proceed, but the timezone cannot be restored.")
+    network_ok = client is not None
+    status: dict[str, Any] | None = None
+
+    if client is not None:
+        try:
+            status = get_status(client)
+            profile = active_profile(status)
+            if profile or status.get("state") in ("connecting", "running", "stopping"):
+                log(f"Disconnecting Throne (profile ID: {profile.get('id') if profile else 'transitioning'}) ...")
+                result = client.command(["--timeout", "3m", "disconnect"], timeout=CONNECT_TIMEOUT)
+                if result.returncode != 0:
+                    log(result.stdout.strip() or "The disconnect command failed.", "WARN")
+            status = wait_status_idle(client, timeout=35)
+            if status.get("state") != "idle" or active_profile(status) is not None:
+                errors.append("Throne did not return to idle after disconnect; TUN and Kill Switch were left unchanged to prevent traffic leaks.")
+                network_ok = False
+            else:
+                log("VPN disconnected.")
+                tun_result = client.command(["tun", "off"], timeout=90)
+                proxy_result = client.command(["proxy", "off"], timeout=90)
+                status = get_status(client)
+                modes_off = not bool(status.get("tun")) and not bool(status.get("system_proxy"))
+                if not modes_off:
+                    detail = []
+                    if bool(status.get("tun")):
+                        detail.append("TUN is still enabled: " + tun_result.stdout.strip())
+                    if bool(status.get("system_proxy")):
+                        detail.append("System Proxy is still enabled: " + proxy_result.stdout.strip())
+                    errors.append(
+                        f"TUN/System Proxy were not fully disabled (tun={status.get('tun')}, system_proxy={status.get('system_proxy')}). "
+                        + " | ".join(detail) + " Kill Switch will remain enabled."
+                    )
+                    network_ok = False
+                else:
+                    settings = get_settings(client)
+                    if bool(settings.get("kill_switch")):
+                        # The setting change is verified below against both the
+                        # runtime state and the persisted setting.
+                        client.command(["settings", "set", "kill_switch=false"], timeout=90)
+                    deadline = time.monotonic() + 35
+                    while time.monotonic() < deadline:
+                        status = get_status(client)
+                        settings = get_settings(client)
+                        if (str(status.get("kill_switch", "unknown")).lower() == "off"
+                                and not bool(settings.get("kill_switch"))):
+                            break
+                        time.sleep(1)
+                    runtime_off = str(status.get("kill_switch", "unknown")).lower() == "off"
+                    setting_off = not bool(settings.get("kill_switch"))
+                    if not runtime_off or not setting_off:
+                        errors.append(
+                            f"Kill Switch shutdown was not verified (runtime={status.get('kill_switch')}, "
+                            f"setting={settings.get('kill_switch')}, error={status.get('kill_switch_error')})."
+                        )
+                        network_ok = False
+                    else:
+                        log("TUN: OFF | System Proxy: OFF | Kill Switch: OFF")
+        except Exception as exc:
+            errors.append(f"Throne communication/control failed: {exc}")
+            network_ok = False
+    else:
+        errors.append("The Throne API is unavailable; VPN disconnection and Kill Switch shutdown could not be performed through the API.")
+
+    # Timezone is independent of the network cleanup, so attempt it even if the
+    # API is unavailable. The network guard is intentionally left fail-closed
+    # whenever the disconnect/mode cleanup could not be verified.
+    if original_zone:
+        try:
+            if not restore_original_timezone(required=False):
+                errors.append("Original timezone restoration did not complete.")
+        except Exception as exc:
+            errors.append(f"Failed to restore the original timezone: {exc}")
+
+    if network_ok:
+        try:
+            clear_session()
+            log("Network session state cleared.")
+        except ManagerError as exc:
+            errors.append(str(exc))
+    else:
+        log("The session file was retained because network cleanup was incomplete, allowing the remaining state to be tracked.", "WARN")
+
+    if errors:
+        section("Partial shutdown — manual review required")
+        for item in errors:
+            log("- " + item, "ERROR")
+        log("Check the current status: vpn-manager --status")
+        return 1
+    section("System successfully restored to normal state")
+    log("VPN: DISCONNECTED")
+    log("TUN: OFF")
+    log("System Proxy: OFF")
+    log("Kill Switch: OFF")
+    if original_zone:
+        log(f"Timezone: {original_zone}")
+    return 0
+
+
+def show_status(client: ThroneClient, config: dict[str, Any]) -> None:
+    section("Current VPN Manager / Throne status")
+    status = get_status(client)
+    settings = get_settings(client)
+    profile = active_profile(status)
+    session = read_session()
+    log(f"Throne state: {status.get('state', 'unknown')}")
+    log(f"Active profile: {profile.get('name')} (ID {profile.get('id')})" if profile else "Active profile: none")
+    if session:
+        log(f"Pinned session: {session.get('profile_name')} (ID {session.get('profile_id')}) | phase={session.get('phase')}")
+        if profile and int(profile.get("id", -1)) != int(session.get("profile_id", -2)):
+            log("WARNING: active profile differs from the session pin. Manager will not switch or reconnect.", "WARN")
+    else:
+        log("Pinned session: none")
+    log(f"TUN mode: {'ON' if status.get('tun') else 'OFF'}")
+    log(f"Tun Auto Redirect: {'ON' if settings.get('tun_auto_redirect') else 'OFF / unknown'}")
+    log(f"System Proxy: {'ON' if status.get('system_proxy') else 'OFF'}")
+    log(f"Kill Switch setting: {'ON' if settings.get('kill_switch') else 'OFF'}")
+    log(f"Kill Switch runtime: {status.get('kill_switch', 'unknown')}")
+    if status.get("kill_switch_error"):
+        log(f"Kill Switch error: {status.get('kill_switch_error')}", "WARN")
+    iface = str(config.get("tun_interface") or DEFAULT_TUN_IFACE)
+    log(f"TUN interface {iface}: {'UP' if tun_interface_up(iface) else 'DOWN / absent'}")
+    log(f"System timezone: {timedatectl_timezone()}")
+    log(f"Original timezone: {ORIGINAL_TZ_FILE.read_text(encoding='utf-8').strip() if ORIGINAL_TZ_FILE.is_file() else 'not saved'}")
+    log(f"Log: {LOG_FILE}")
+
+
+def choose_group_guarded(client: ThroneClient, config: dict[str, Any]) -> None:
+    status = get_status(client)
+    if active_profile(status) or status.get("state") != "idle" or read_session():
+        raise ManagerError("The subscription group cannot be changed during an active session. Run vpn-manager --stop first.")
+    choose_group(client, config, force=True)
+
+
+def print_recovery_hint() -> None:
+    log("\nRecovery instructions:", "WARN")
+    log("To view status: vpn-manager --status", "WARN")
+    log("To disconnect the VPN, disable TUN/System Proxy/Kill Switch, and restore the original timezone: vpn-manager --stop", "WARN")
+    log("If the API is unavailable, do not disable Kill Switch blindly; check the connection state in Throne first.", "WARN")
+
+
+def acquire_lock() -> Any:
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    handle = LOCK_FILE.open("a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        raise ManagerError("Another instance of VPN Manager is already running.")
+    return handle
+
+
+def main() -> int:
+    allowed = {"--start", "--run", "--stop", "--reset", "--status", "--choose-group", "--reset-timezone", "--version", "--help", "-h"}
+    args = sys.argv[1:]
+    if len(args) > 1 or any(arg not in allowed for arg in args):
+        print("Usage: vpn-manager [--start | --stop | --status | --choose-group | --reset-timezone | --version]")
+        return 2
+    if args and args[0] == "--version":
+        print(f"{APP} {VERSION}")
+        return 0
+    if args and args[0] in ("--help", "-h"):
+        print("""vpn-manager
+  --start, --run    Start a pinned single-profile VPN session
+  --stop, --reset   Disconnect VPN, turn TUN/proxy/Kill Switch off, restore original timezone
+  --status          Show Throne and pinned-session status
+  --choose-group    Select the subscription group used for a future session
+  --reset-timezone  Restore only the original timezone
+  --version         Show installed version""")
+        return 0
+
+    if os.geteuid() == 0:
+        print("Run vpn-manager as your normal desktop user, not with sudo.", file=sys.stderr)
+        return 2
+    init_dirs()
+    lock = None
+    try:
+        lock = acquire_lock()
+        log(f"{APP} {VERSION} started. Log: {LOG_FILE}")
+        command = args[0] if args else None
+
+        if command in ("--stop", "--reset"):
+            if shutil.which("thronectl") is None:
+                client = None
+            else:
+                try:
+                    client = ThroneClient(allow_key_prompt=False)
+                    api_health(client)
+                except Exception as exc:
+                    log(f"API is not ready: {exc}", "WARN")
+                    client = None
+            return stop_session(client)
+
+        if command == "--reset-timezone":
+            return 0 if restore_original_timezone(required=False) else 1
+
+        if shutil.which("thronectl") is None:
+            raise ManagerError("thronectl is not installed. Install the official Throne Linux package or a compatible binary.")
+        client = ThroneClient()
+        api_health(client)
+        config = load_config()
+
+        if command == "--status":
+            show_status(client, config)
+            return 0
+        if command == "--choose-group":
+            choose_group_guarded(client, config)
+            return 0
+
+        if command in ("--start", "--run"):
+            start_session(client, config, config.get("group_id"))
+            return 0
+
+        # Interactive menu: one explicit Start or Stop action per invocation.
+        choice = choose_menu("VPN Manager — Single VPN Session", [
+            "Start VPN session (pin one profile)",
+            "Stop VPN and restore normal system state",
+            "Show status",
+            "Choose subscription group",
+            "Exit",
+        ])
+        if choice == 0:
+            start_session(client, config, config.get("group_id"))
+        elif choice == 1:
+            return stop_session(client)
+        elif choice == 2:
+            show_status(client, config)
+        elif choice == 3:
+            choose_group_guarded(client, config)
+        else:
+            log("Exit.")
+        return 0
+
+    except KeyboardInterrupt:
+        log("\nOperation interrupted by the user. VPN and Kill Switch states were intentionally left unchanged.", "WARN")
+        print_recovery_hint()
+        return 130
+    except ManagerError as exc:
+        log(f"Error: {exc}", "ERROR")
+        print_recovery_hint()
+        log(f"Log file: {LOG_FILE}")
+        return 1
+    except Exception as exc:
+        log(f"Unexpected error: {type(exc).__name__}: {exc}", "ERROR")
+        print_recovery_hint()
+        log(f"Log file: {LOG_FILE}")
+        return 1
+    finally:
+        if lock is not None:
+            lock.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

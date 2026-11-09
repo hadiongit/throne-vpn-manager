@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Local configuration and credentials
+.env
+.env.*
+config.json
+api-key
+session.json
+original-timezone
+
+# Runtime state and diagnostics
+logs/
+*.log
+*.pid
+*.tmp
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
