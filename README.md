@@ -4,7 +4,6 @@
 
 VPN Manager automates a Throne VPN session on Debian/Linux. Each session is pinned to one static profile. Once a profile reaches `RUNNING`, the manager never connects another profile during that session. The Stop workflow disconnects the VPN, disables TUN and System Proxy, disables Kill Switch last, and restores the saved original system timezone.
 
-All application-generated menus, prompts, status messages, warnings, and errors are in English. Profile names and subscription group names are supplied by the subscription provider and are displayed unchanged; a provider may therefore supply names in another language.
 
 ## Requirements
 
